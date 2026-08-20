@@ -1,0 +1,163 @@
+You are building a product-data enrichment pipeline for the "Unihack" industrial
+product-intelligence hackathon. Read this entire prompt before writing any code.
+
+## GOAL
+Given messy raw product rows (industrial distributor catalogue data), produce
+structured, standardized, search-ready product records matching Unilog's 252-column
+Delivery Format schema — for a deliberately narrow, well-evidenced slice of the
+problem, not a shallow pass over everything.
+
+## FILES YOU HAVE (inspect all of them before writing pipeline code — several have
+non-trivial structure: merged cells, multi-row headers, or side-by-side column
+blocks. Do not assume row 0 is a clean header on any sheet.)
+
+Working data (what you process):
+  - Sample-1000_Items.xlsx            1,000 raw rows: Mfg_Part_Num, Part_Desc,
+                                       E1_Brand, Unilog_Brand, DIB_Brand, Part_Manuf
+  - Unilog-Sample_200_Items-Input-vs-Output.xlsx
+       Sheet "Input"           = 200 raw rows (also has Dept/Class/Fine/SKU)
+       Sheet "Delivery Format" = the same 200 rows, fully enriched, 252 columns
+                                 — THIS IS YOUR GROUND TRUTH. Use it to design the
+                                 output schema and to score field-level accuracy.
+
+Rule book (how output must be written):
+  - UNILOG_INTERNAL_CONTENT_GUIDELINES.docx
+       Construction formulas, character limits, casing rules per field, plus
+       category-specific and sourcing rules. Treat as your generation spec.
+  - Unilog_Master_UOM_Standards_Abbreviations_and_Terms.xlsx
+       Sheet 1: ~500 approved unit abbreviations across 89 measurement types
+                (has a worked example column). This is the ONLY permitted way to
+                write a unit. Always keep a space between number and unit
+                (e.g. "24 in", not "24in").
+       Sheet 2: 22 house-style rules (hyphenation, symbols, abbreviations).
+  - Decimal_Fraction.xlsx
+       63 exact inch conversions, laid out as FOUR side-by-side Fraction|Decimal
+       blocks — read it as 4 stacked pairs of columns, not one flat table.
+       (0.5 in ↔ 1/2 in, 50.25 in ↔ 50-1/4 in)
+
+Master data / controlled vocabularies (allowed values):
+  - UniCat_Manufacturer_and_Brand_List.xlsx
+       27,000+ rows: MANUFACTURER_NAME, MANUFACTURER_CODE, BRAND_NAME, BRAND_CODE,
+       with exact legal casing/spacing/suffixes/®/™. Where an item has no brand,
+       use the manufacturer name in its place.
+  - Unicat_Lov_v1_0_Updated_With_Remarks.xlsx
+       ~161,000 rows: Classpath | Leaf Node | Filtering Y/N | Attribute Label |
+       Attribute Values | Normalized Label | Normalized Values | Guidelines |
+       Remarks. This is the constrained vocabulary — attribute values MUST come
+       from here, not be freely generated.
+  - FAUCETS_LOV.xlsx   — full category spec for Kitchen/Bath Sink Faucets
+                         (Summary/UNSPSC, description build order, attribute
+                         sequence + permitted values + synonyms, style guide)
+  - Fittings_LOV.xlsx  — full category spec for pipe/tube/hose fittings
+                         (390 Fitting Types with sources, 1,472 connection-type
+                         variants → 515 canonical values, 464 Material values
+                         → 113 canonical values)
+
+Index:
+  - Reference_Documents_Summary.xlsx — one-page map of the 7 reference files above.
+    Read this FIRST.
+
+## HARD CONSTRAINTS (violating these makes output invalid, not just imperfect)
+1. Treat "-- Unbranded --", "-- No Unilog Brand --", "-- No DIB Brand --" (and any
+   "-- No X --" pattern) as NULL, everywhere, from the moment you load the data.
+2. Attribute values must come from the LOV's Normalized Values for the row's
+   Classpath. Manufacturer/brand names must exactly match the approved list —
+   symbols and casing included. Units must use the approved UOM abbreviation.
+   NEVER invent a value that isn't traceable to an input field or a lookup table.
+3. Product data must come from the manufacturer's own site/documentation only.
+   Marketplaces and distributor sites are explicitly excluded as sources — if you
+   add a web-fetch enrichment step, enforce this domain check before accepting
+   any fetched content.
+4. It's fine — and rewarded — for output fields to be blank when you can't derive
+   them confidently. Do not pad rows with guessed values to look complete. Flag
+   uncertain fields instead of guessing.
+
+## SCOPE FOR THIS BUILD (confirm/adjust with me before generating 1,000 rows of
+output, but proceed with steps 1-3 immediately)
+1. Inspect Sample-1000_Items.xlsx and tell me which of Faucets vs Fittings has more
+   matching rows (by keyword match against Part_Desc / the two LOV files' category
+   terms). Recommend one category to focus the full pipeline on. Default to
+   Fittings if it's a close call, since it has the clearer many-to-one
+   normalization structure (connection types, materials) to demonstrate.
+2. Within that category, build these three pipeline stages completely and
+   correctly, end to end, validated against the 200-item ground truth:
+     a. Manufacturer/brand resolution (fuzzy match to canonical list)
+     b. Attribute extraction + normalization (Part_Desc → structured attributes,
+        constrained to the category's LOV, units normalized via the UOM table
+        and Decimal_Fraction table)
+     c. Description generation for INVOICE_DESC, MOBILE_DESC, SHORT_DESC,
+        LONG_DESC1 (at minimum), built from templates/formulas in the content
+        guidelines using ONLY already-resolved structured fields
+3. Add a per-row, per-field confidence score and a "needs human review" flag,
+   computed from: manufacturer-match score, % of attributes resolved against the
+   LOV, and whether structured extraction validated cleanly.
+4. Everything else in the 252-column schema (UNSPSC, digital assets, GTIN/UPC,
+   dimensions not covered by extracted attributes, etc.) — leave blank. Do not
+   attempt to fabricate these; note them as "not attempted in this scope" in your
+   final report, not as pipeline failures.
+
+## PIPELINE STRUCTURE (build as separate, individually testable modules —
+run in this order)
+  0_ingest.py           Load & clean all source files into cached lookup tables
+                         (parquet). Apply the placeholder-nulling rule here, once.
+  1_dedup.py             Exact-key + fuzzy near-duplicate detection on the 1,000
+                         working rows (rapidfuzz, report duplicate clusters).
+  2_manufacturer_brand.py  Fuzzy-resolve Part_Manuf / brand columns to canonical
+                         MANUFACTURER_NAME / BRAND_NAME using rapidfuzz against
+                         the 27k master list; fall back to manufacturer name when
+                         no brand exists; log match score per row.
+  3_classify.py           Classpath assignment: embedding shortlist (top-k) over
+                         the LOV's Classpath/Leaf Node text, then final selection.
+                         Constrain strictly to the scoped category's valid leaf
+                         nodes for this build.
+  4_attributes.py         Structured attribute extraction from Part_Desc,
+                         constrained to the Classpath's valid Attribute Labels/
+                         Values from the LOV (JSON-schema-constrained LLM call,
+                         temperature 0) plus a regex pass for high-confidence
+                         numeric patterns (voltage, amperage, sizes).
+  5_normalize.py           Unit normalization via the UOM lookup table; decimal↔
+                         fraction conversion via Decimal_Fraction; casing/
+                         hyphenation per the house-style rules sheet.
+  6_describe.py            Template-first construction of each required
+                         description field from resolved structured fields, using
+                         the exact formulas/char-limits/casing rules from the
+                         content guidelines doc. LLM used only to phrase/order,
+                         never to introduce new facts.
+  7_score_confidence.py    Per-row/per-field confidence scoring + review flag.
+  8_assemble_output.py     Map everything into the exact 252-column Delivery
+                         Format schema (correct column names/order — read them
+                         from the "Delivery Format" sheet header, do not
+                         hand-type them) and write both a CSV/XLSX deliverable
+                         and a parallel per-SKU JSONL audit trail (which stage
+                         produced each field, from what evidence, confidence).
+  scripts/evaluate.py      Standalone, re-runnable: field-level accuracy vs the
+                         200-item ground truth (exact + fuzzy match rates per
+                         field), character-limit compliance %, % of attribute
+                         values found in the LOV. Print a clean summary table.
+
+## DELIVERABLES I EXPECT AT THE END
+1. Working pipeline code, modules as listed above, runnable end-to-end on the
+   1,000-item file for the chosen category subset.
+2. `scripts/evaluate.py` output: a metrics report comparing pipeline output to the
+   200-item ground truth (this is what judges will look for per the brief).
+3. Output file(s) in the exact Delivery Format schema (column names/order taken
+   from the real header, not retyped).
+4. A per-SKU JSONL audit trail for explainability.
+5. A short README explaining: which category and stages were chosen and why,
+   what was deliberately left out of scope and why, how to re-run the eval, and
+   the headline accuracy numbers.
+6. If time allows: a minimal Streamlit app showing one row's journey through each
+   pipeline stage, for the live demo.
+
+## WORKING STYLE
+- Inspect every source file's real structure before writing parsing code for it —
+  several are known to have merged cells / multi-row headers / side-by-side
+  blocks. Don't guess a layout; print it and confirm.
+- Keep the LLM's role bounded and auditable: classification shortlisting,
+  constrained extraction, and phrasing only — never free generation of facts.
+- Prefer deterministic/rule-based logic (lookups, regex, fuzzy match) wherever the
+  problem is a closed vocabulary — reserve LLM calls for genuinely ambiguous
+  natural-language interpretation.
+- After step 2 (ingestion + category selection), stop and show me: the category
+  decision with row counts, and a sample of 3 rows through stages 0-2, before
+  continuing to build the rest of the pipeline.

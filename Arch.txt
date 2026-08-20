@@ -1,0 +1,88 @@
+                         ┌─────────────────────────────────────────────┐
+                         │              0. INGESTION LAYER              │
+                         │  Load & normalize all source spreadsheets    │
+                         │  (working data, rule book, master data)      │
+                         │  → clean placeholder values                  │
+                         │  → cache as typed lookup tables (parquet)    │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │        1. INPUT ANALYSIS & DEDUPLICATION     │
+                         │  - parse Part_Desc into raw tokens           │
+                         │  - detect duplicate/near-duplicate SKUs      │
+                         │    (MinHash / fuzzy match on desc+MPN)       │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │     2. MANUFACTURER & BRAND RESOLUTION       │
+                         │  - fuzzy match Part_Manuf / *_Brand columns  │
+                         │    against UniCat_Manufacturer_and_Brand      │
+                         │  - resolve to canonical MANUFACTURER_NAME,   │
+                         │    BRAND_NAME (with ®/™), or fall back to    │
+                         │    manufacturer name when no brand exists    │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │     3. TAXONOMY / CLASSPATH CLASSIFICATION   │
+                         │  - LLM or embedding-similarity classifier    │
+                         │    over the Classpath vocabulary in the LOV  │
+                         │  - constrain to valid leaf nodes only         │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │        4. ATTRIBUTE EXTRACTION               │
+                         │  - LLM extraction constrained to the LOV's   │
+                         │    Attribute Label / Attribute Values for    │
+                         │    that Classpath (structured JSON output)   │
+                         │  - regex/rule pass for obvious patterns      │
+                         │    (dimensions, voltage, amperage, sizes)    │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │   5. ENRICHMENT FROM MANUFACTURER SOURCES    │
+                         │  (optional/stretch — respects sourcing       │
+                         │   hierarchy: manufacturer site > nothing;    │
+                         │   marketplaces/distributors excluded)        │
+                         │  - targeted web fetch of manufacturer page   │
+                         │    for the resolved MPN, RAG-style extract   │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │      6. CLEANSING & NORMALIZATION            │
+                         │  - unit strings → approved UOM abbreviation  │
+                         │    (Unilog_Master_UOM table, exact form)      │
+                         │  - decimals ↔ fractions via Decimal_Fraction  │
+                         │    lookup (0.5 in → 1/2 in)                   │
+                         │  - casing / hyphenation per house-style rules │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │      7. DESCRIPTION BUILDING                 │
+                         │  - deterministic template + LLM fill for     │
+                         │    each of: INVOICE_DESC (≤40, CAPS),        │
+                         │    MOBILE_DESC (60–80 char), SHORT_DESC,      │
+                         │    LONG_DESC1, RETAIL_DESC,                   │
+                         │    MARKETING_DESCRIPTION, ITEM_FEATURES_n     │
+                         │  - each built strictly from already-resolved  │
+                         │    structured fields (brand, series, MPN,     │
+                         │    attributes) — never invented free text     │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │   8. VALIDATION, SCORING & CONFIDENCE         │
+                         │  - char-limit compliance check per field      │
+                         │  - % of attribute values found in LOV         │
+                         │  - field-level accuracy vs 200-item ground    │
+                         │    truth (exact match / fuzzy match / n/a)    │
+                         │  - per-field + per-row confidence score,      │
+                         │    "needs human review" flag                  │
+                         └───────────────────┬───────────────────────────┘
+                                              │
+                         ┌────────────────────▼───────────────────────┐
+                         │        9. OUTPUT ASSEMBLY                     │
+                         │  - map to the exact 252-column Delivery      │
+                         │    Format schema, correct column order        │
+                         │  - write CSV/XLSX + a JSON audit trail        │
+                         │    (per field: source stage, confidence,      │
+                         │    raw evidence) for explainability            │
+                         └────────────────────────────────────────────┘
